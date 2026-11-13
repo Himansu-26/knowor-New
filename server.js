@@ -1,7 +1,9 @@
 // Knowora backend: keeps the API key secret, calls the AI model (with model fallback), stores history in db.json
-process.loadEnvFile();
+
 const express = require("express");
 const fs = require("fs");
+if (fs.existsSync('.env')){
+process.loadEnvFile();}
 const path = require("path");
 const { createClient } = require("@supabase/supabase-js");
 
