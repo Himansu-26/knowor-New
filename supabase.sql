@@ -1,17 +1,11 @@
-create table if not exists cache (
-  hash text primary key,
+-- Run this once in Supabase > SQL Editor
+create table if not exists history (
+  id bigint generated always as identity primary key,
+  user_id uuid not null default auth.uid() references auth.users on delete cascade,
   result jsonb not null,
-  created_at timestamptz default now()
+  created_at timestamptz not null default now()
 );
-create table if not exists identifications (
-  id uuid primary key default gen_random_uuid(),
-  user_id uuid references auth.users on delete cascade,
-  query text,
-  name text,
-  category text,
-  result jsonb,
-  created_at timestamptz default now()
-);
-alter table identifications enable row level security;
-alter table cache enable row level security;
-create policy "own rows" on identifications for select using (auth.uid() = user_id);
+alter table history enable row level security;
+-- each user can only see and change their own rows
+create policy "own rows" on history for all
+  using (auth.uid() = user_id) with check (auth.uid() = user_id);
