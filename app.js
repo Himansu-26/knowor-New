@@ -1,89 +1,134 @@
-const $ = id => document.getElementById(id);
-let sb, session, lastQuiz = null;
+const $ = (s) => document.querySelector(s);
+let imgB64 = null, imgMime = "image/jpeg", stream = null, lastResult = null;
 
-(async () => {
-  fetch('/health').catch(() => {});                       // wake the server early
-  const c = await (await fetch('/api/config')).json();
-  sb = supabase.createClient(c.url, c.anon);
-  const { data } = await sb.auth.getSession(); setSession(data.session);
-  sb.auth.onAuthStateChange((_, s) => setSession(s));
-})();
+// escape text so AI output can never inject HTML
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
-function setSession(s) {
-  session = s; $('auth').hidden = !!s; $('out').hidden = !s;
-  document.querySelectorAll('.tab').forEach(t => t.hidden = true);
-  if (s) show('home');
-}
-function show(tab) {
-  if (!session) return;
-  document.querySelectorAll('.tab').forEach(t => t.hidden = t.id !== tab);
-  document.querySelectorAll('nav [data-tab]').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
-  if (tab === 'history') loadHistory(); if (tab === 'quiz') renderQuiz();
-}
-document.querySelectorAll('nav [data-tab]').forEach(b => b.onclick = () => show(b.dataset.tab));
-$('out').onclick = () => sb.auth.signOut();
+// ---------- navigation ----------
+$("#menuBtn").onclick = () => $("#menu").classList.toggle("open");
+$("#menu").onclick = () => $("#menu").classList.remove("open");
 
-async function auth(kind) {
-  const f = kind === 'up' ? sb.auth.signUp : sb.auth.signInWithPassword;
-  const { error } = await f.call(sb.auth, { email: $('em').value, password: $('pw').value });
-  $('amsg').textContent = error ?  error.message : (kind === 'up' ? 'Account created! If asked, confirm your email, then sign in.' : '');
+// ---------- image handling (resized to keep uploads small) ----------
+function setImage(file) {
+  if (!file || !file.type.startsWith("image/")) return showError("Please choose an image file.");
+  const img = new Image();
+  img.onload = () => {
+    const max = 1024, k = Math.min(1, max / Math.max(img.width, img.height));
+    const c = document.createElement("canvas");
+    c.width = img.width * k; c.height = img.height * k;
+    c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+    const url = c.toDataURL("image/jpeg", 0.85);
+    imgB64 = url.split(",")[1]; imgMime = "image/jpeg";
+    $("#preview").src = url; $("#preview").hidden = false; $("#dropText").hidden = true;
+    $("#goBtn").disabled = false;
+  };
+  img.src = URL.createObjectURL(file);
 }
-$('in').onclick = () => auth('in'); $('up').onclick = () => auth('up');
+$("#fileInput").onchange = (e) => setImage(e.target.files[0]);
+$("#camInput").onchange = (e) => setImage(e.target.files[0]);
+const drop = $("#drop");
+["dragover", "dragenter"].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.add("over"); }));
+["dragleave", "drop"].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.remove("over"); }));
+drop.addEventListener("drop", (e) => setImage(e.dataTransfer.files[0]));
 
-// resize image to ~1024px JPEG so each photo = one small, fast request
-function compress(file) {
-  return new Promise(res => {
-    const img = new Image(); img.onload = () => {
-      const s = Math.min(1, 1024 / Math.max(img.width, img.height)), cv = document.createElement('canvas');
-      cv.width = img.width * s; cv.height = img.height * s; cv.getContext('2d').drawImage(img, 0, 0, cv.width, cv.height);
-      const url = cv.toDataURL('image/jpeg', .8); $('prev').src = url; $('prev').hidden = false; res(url.split(',')[1]);
-    }; img.src = URL.createObjectURL(file);
-  });
-}
-async function ready() {                                   // handles Render cold start quietly
-  for (let i = 0; i < 12; i++) { try { if ((await fetch('/health')).ok) return; } catch {} $('status').textContent = 'Getting Knowora ready…'; await new Promise(r => setTimeout(r, 4000)); }
-}
-let busy = false;
-async function identify(body) {
-  if (busy) return; busy = true; $('result').innerHTML = ''; $('status').textContent = 'Knowora is looking… 🔍';
+// ---------- live camera ----------
+$("#liveBtn").onclick = async () => {
   try {
-    await ready();
-    const r = await fetch('/api/identify', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + session.access_token }, body: JSON.stringify({ ...body, lang: $('lang').value }) });
-    const j = await r.json();
-    $('status').textContent = j.soft || j.error ? (j.message || j.error) : '';
-    if (j.result) render(j.result);
-  } catch { $('status').textContent = 'Connection hiccup. Please tap once more.'; }
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+    $("#video").srcObject = stream; $("#camModal").hidden = false;
+  } catch { showError("Camera not available. Use 'Take photo' instead (camera needs HTTPS or localhost)."); }
+};
+const stopCam = () => { stream?.getTracks().forEach((t) => t.stop()); $("#camModal").hidden = true; };
+$("#closeCam").onclick = stopCam;
+$("#snapBtn").onclick = () => {
+  const v = $("#video"), c = document.createElement("canvas");
+  c.width = v.videoWidth; c.height = v.videoHeight;
+  c.getContext("2d").drawImage(v, 0, 0);
+  c.toBlob((b) => setImage(b), "image/jpeg", 0.9); stopCam();
+};
+
+// ---------- calling the backend ----------
+$("#goBtn").onclick = () => identify({ image: imgB64, mime: imgMime }, $("#preview").src);
+$("#searchForm").onsubmit = (e) => { e.preventDefault(); identify({ query: $("#searchInput").value.trim() }); };
+
+// ONE request per photo. A double-click guard stops accidental extra calls.
+let busy = false;
+async function identify(body, thumb) {
+  if (busy) return;
+  busy = true;
+  showError(""); $("#result").hidden = true; $("#loader").hidden = false;
+  speechSynthesis.cancel();
+  try {
+    const r = await fetch("/api/identify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || "Something went wrong");
+    render(data, thumb); loadHistory();
+    $("#result").scrollIntoView({ behavior: "smooth" });
+  } catch (e) { showError(e.message); }
+  $("#loader").hidden = true;
   busy = false;
 }
-['cam', 'up-file'].forEach(id => $(id).onchange = async e => { if (e.target.files[0]) identify({ image: await compress(e.target.files[0]) }); e.target.value = ''; });
-$('go').onclick = () => { const t = $('q').value.trim(); if (t) { $('prev').hidden = true; identify({ text: t }); } };
-$('q').onkeydown = e => e.key === 'Enter' && $('go').click();
+function showError(m) { const e = $("#error"); e.textContent = m; e.hidden = !m; }
 
-const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-function render(r) {
-  lastQuiz = r.quiz; const n = encodeURIComponent(r.name);
-  const sec = (t, v) => v ? `<h3>${t}</h3><p>${esc(v)}</p>` : '';
-  $('result').innerHTML = `<div class="card"><h2>${esc(r.name)}</h2><span class="tag">${esc(r.category)}</span>
-  ${r.living === true ? '<span class="tag">Living</span>' : r.living === false ? '<span class="tag">Non-living</span>' : ''}
-  ${r.scientificName ? `<span class="tag"><i>${esc(r.scientificName)}</i></span>` : ''}
-  ${r.confidence ? `<span class="tag">${esc(r.confidence)}% sure</span>` : ''}
-  <p>${esc(r.summary)}</p><button id="say">🔊 Listen</button>
-  ${(r.details || []).map(d => sec(d.title, d.text)).join('')}
-  ${sec('How it works / how to use', r.howItWorksOrUse)}
-  ${r.funFacts?.length ? `<h3>Fun facts</h3><ul>${r.funFacts.map(f => `<li>${esc(f)}</li>`).join('')}</ul>` : ''}
-  ${sec('Approximate price', r.priceRange)}${sec('Where to find it', r.whereToFind)}${sec('Can it be bought?', r.purchaseNote)}
-  ${r.conservation?.status ? `<h3>Conservation</h3><p><b>${esc(r.conservation.status)}</b> — ${esc(r.conservation.note)}</p>` : ''}
-  ${r.similar?.length ? `<h3>Similar</h3>${r.similar.map(s => `<span class="tag">${esc(s)}</span>`).join('')}` : ''}
-  ${r.priceRange && r.living !== true ? `<div class="row"><a class="btn" target="_blank" rel="noopener" href="https://www.google.com/search?tbm=shop&q=${n}">🛒 Google Shopping</a><a class="btn alt" target="_blank" rel="noopener" href="https://www.amazon.com/s?k=${n}">Amazon</a></div>` : ''}</div>`;
-  $('say').onclick = () => { speechSynthesis.cancel(); speechSynthesis.speak(new SpeechSynthesisUtterance(r.name + '. ' + r.summary)); };
+// ---------- show the answer ----------
+const list = (a) => (a?.length ? `<ul>${a.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>` : "");
+const block = (t, body) => (body ? `<div class="block"><h3>${t}</h3>${body}</div>` : "");
+const para = (s) => (s ? `<p>${esc(s)}</p>` : "");
+
+function render(r, thumb) {
+  lastResult = r;
+  const q = encodeURIComponent(r.name || "");
+  const living = r.living || ["animal", "bird", "plant"].includes(r.category);
+  $("#result").innerHTML = `
+    <div class="rhead">
+      ${thumb ? `<img src="${thumb}" alt="">` : ""}
+      <div>
+        <h2>${esc(r.name)}</h2>
+        <span class="tag">${esc(r.category)}</span><span class="tag alt">${esc(r.confidence)} confidence</span>
+        ${r.scientificName ? `<div class="sci">${esc(r.scientificName)}</div>` : ""}
+      </div>
+    </div>
+    <p>${esc(r.summary)}</p>
+    <button class="voice" id="voiceBtn">🔊 Listen</button>
+    ${(r.details || []).map((d) => block(esc(d.title), para(d.text))).join("")}
+    ${living ? block("Wild or domestic?", para(r.wildOrDomestic)) + block("Habitat", para(r.habitat)) + block("Food", para(r.diet)) : ""}
+    ${block("How it works", para(r.howItWorks))}${block("How to use it", para(r.howToUse))}
+    ${block("Types", list(r.types))}
+    ${block("Interesting facts", list(r.facts))}
+    ${block("Conservation", (r.conservationStatus ? `<p><span class="tag alt">${esc(r.conservationStatus)}</span></p>` : "") + para(r.conservationInfo))}
+    ${r.buyable ? block("Approximate price", para(r.priceRange)) + `<div class="block pills shop">
+        <a target="_blank" rel="noopener" href="https://www.amazon.in/s?k=${q}">🛒 Amazon</a>
+        <a target="_blank" rel="noopener" href="https://www.flipkart.com/search?q=${q}">🛍️ Flipkart</a>
+        <a target="_blank" rel="noopener" href="https://www.google.com/search?tbm=shop&q=${q}">🔎 Google Shopping</a></div>` : ""}
+    ${r.similar?.length ? block("Similar things", `<div class="pills">${r.similar.map((s) => `<button data-q="${esc(s)}">${esc(s)}</button>`).join("")}</div>`) : ""}`;
+  $("#result").hidden = false;
+  $("#voiceBtn").onclick = speak;
+  $("#result").querySelectorAll("[data-q]").forEach((b) => (b.onclick = () => { $("#searchInput").value = b.dataset.q; identify({ query: b.dataset.q }); }));
 }
+
+// ---------- voice explanation ----------
+function speak() {
+  if (speechSynthesis.speaking) { speechSynthesis.cancel(); $("#voiceBtn").textContent = "🔊 Listen"; return; }
+  const r = lastResult;
+  const u = new SpeechSynthesisUtterance([r.name + ".", r.summary, ...(r.facts || []).slice(0, 3).map((f) => "Fun fact: " + f)].join(" "));
+  u.onend = () => ($("#voiceBtn").textContent = "🔊 Listen");
+  $("#voiceBtn").textContent = "⏹ Stop";
+  speechSynthesis.speak(u);
+}
+
+// ---------- history (from the database) ----------
 async function loadHistory() {
-  const j = await (await fetch('/api/history', { headers: { Authorization: 'Bearer ' + session.access_token } })).json();
-  $('hlist').innerHTML = j.items.length ? '' : '<p class="msg">Nothing yet.</p>';
-  j.items.forEach(i => { const d = document.createElement('div'); d.className = 'card'; d.innerHTML = `<b>${esc(i.name)}</b> <span class="tag">${esc(i.category)}</span>`; d.onclick = () => { show('home'); render(i.result); }; $('hlist').append(d); });
+  try {
+    const items = await (await fetch("/api/history")).json();
+    $("#historyList").innerHTML = items.length
+      ? items.map((h, i) => `<button data-i="${i}"><b>${esc(h.result.name)}</b><br><small>${esc(h.result.category)} · ${new Date(h.time).toLocaleDateString()}</small></button>`).join("")
+      : "<p>Nothing yet. Identify something!</p>";
+    $("#historyList").querySelectorAll("[data-i]").forEach((b) => (b.onclick = () => { render(items[b.dataset.i].result); $("#result").scrollIntoView({ behavior: "smooth" }); }));
+  } catch {}
 }
-function renderQuiz() {
-  const q = lastQuiz; if (!q) return;
-  $('qbox').innerHTML = `<h3>${esc(q.question)}</h3>` + q.options.map((o, i) => `<button class="opt" data-i="${i}">${esc(o)}</button>`).join('') + '<p id="exp" class="msg"></p>';
-  $('qbox').querySelectorAll('.opt').forEach(b => b.onclick = () => { const ok = +b.dataset.i === q.answerIndex; b.classList.add(ok ? 'good' : 'bad'); if (!ok) $('qbox').querySelector(`[data-i="${q.answerIndex}"]`).classList.add('good'); $('exp').textContent = q.explanation; });
-}
+$("#clearBtn").onclick = async () => { await fetch("/api/history", { method: "DELETE" }); loadHistory(); };
+loadHistory();
